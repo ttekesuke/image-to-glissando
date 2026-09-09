@@ -1,0 +1,1344 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image → Glissando (Adaptive layout / near-vertical gliss)</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vexflow@4.2.2/build/cjs/vexflow.js"></script>
+    <style>
+        body { font-family: sans-serif; }
+        .layout { display: flex; align-items: flex-start; gap: 16px; }
+        .left-pane { width: 340px; flex: 0 0 340px; }
+        .right-pane { flex: 1 1 auto; min-width: 0; }
+        .preview-stack { position: relative; width: 320px; }
+        .preview-stack canvas { display: block; width: 100%; }
+        .preview-stack .overlay { position: absolute; inset: 0; pointer-events: none; }
+        #binary-preview { display: block; width: 320px; }
+        #score-viewport { position: relative; overflow: hidden; }
+    </style>
+</head>
+<body>
+<div id="app">
+    <h1>Image → Glissando</h1>
+
+    <div class="layout">
+        <div class="left-pane">
+            <p><input type="file" ref="fileInput" accept="image/*" @change="handleFileSelect"></p>
+            <div @dragover.prevent @drop.prevent="handleDrop">または画像をここにドロップ</div>
+
+            <template v-if="sourceImage">
+                <p>
+                    <label>
+                        二値化しきい値: {{ threshold }}
+                        <input type="range" min="0" max="255" step="1" v-model="threshold" @input="updateThresholdPreview">
+                    </label>
+                    Otsu: {{ autoThreshold }}
+                </p>
+
+                <p>
+                    <button @click="renderScoreFromCurrentImage">楽譜化</button>
+                    <button @click="saveScoreAsPng" :disabled="!stats">PNG保存</button>
+                </p>
+
+                <p>元画像 + 境界線</p>
+                <div class="preview-stack">
+                    <canvas ref="originalCanvas"></canvas>
+                    <canvas ref="segmentCanvas" class="overlay"></canvas>
+                </div>
+
+                <p>二値化プレビュー</p>
+                <canvas ref="edgeCanvas" id="binary-preview"></canvas>
+            </template>
+        </div>
+
+        <div class="right-pane">
+            <p v-if="stats">
+                解析線分: {{ stats.segments }} /
+                楽譜線分: {{ stats.scoreSegments }} /
+                声部: {{ stats.voices }} /
+                音符イベント: {{ stats.noteEvents }} /
+                接続線: {{ stats.stavelines }} /
+                小節: {{ stats.measures }} /
+                五線: {{ stats.staves }} /
+                解析: {{ stats.analysisCols }}×{{ stats.analysisRows }}
+            </p>
+
+            <div id="score-viewport" ref="scoreViewport">
+                <div id="vexflow-container" ref="vexflowContainer"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const { createApp, ref, nextTick } = Vue;
+
+createApp({
+    setup() {
+        const sourceImage = ref(null);
+        const imageState = ref(null);
+        const threshold = ref(128);
+        const autoThreshold = ref(128);
+        const stats = ref(null);
+        const dragover = ref(false);
+        const fileInput = ref(null);
+        const originalCanvas = ref(null);
+        const segmentCanvas = ref(null);
+        const edgeCanvas = ref(null);
+        const vexflowContainer = ref(null);
+        const scoreViewport = ref(null);
+
+        // 表示サイズのみ固定。入力画像の寸法・比率は任意とする。
+        const DISPLAY_W = 1280;
+        const DISPLAY_H = 720;
+
+        // 基本ルール（ユーザー指定で固定）
+        const ANALYSIS_CELL_PX = 5;      // 解析用の基準セルサイズ
+        const ANALYSIS_COLS_PER_SCORE_COL = 4; // 解析4セル = 四分音符1拍
+        const PITCHES_PER_STAFF_FIXED = 8;     // 線間4 + 上2 + 下2
+        const COLS_PER_MEASURE = 4;      // 4/4拍子、最小単位は四分音符
+        const MEASURE_WIDTH = 160;       // 小節幅
+        const STAFF_GAP = 40;            // ある五線の最下線と次の五線の最上線の間
+        const STAFF_BAND = 80;           // 40px staff本体 + 40px gap
+        const TOP_MARGIN = 60;           // 上側予約領域（clef, stems, ties 用）
+        const BOTTOM_MARGIN = 60;        // 下側予約領域
+
+        // 各staffで使う8位置は、五線の「間」4つに加え、上2つ・下2つの空間位置。
+        // すべて space 位置だけを使うので、加線を出さずに上下対称な配置になる。
+        // 上から: B5, G5, E5, C5, A4, F4, D4, B3
+        const NATURAL_MIDIS = [83, 79, 76, 72, 69, 65, 62, 59];
+
+        function buildPitchTable(staffCount) {
+            return Array.from({ length: staffCount }, () => NATURAL_MIDIS.slice());
+        }
+
+        function buildLayout(srcW, srcH) {
+            const analysisCols = Math.max(4, Math.round(srcW / ANALYSIS_CELL_PX));
+            const analysisRows = Math.max(PITCHES_PER_STAFF_FIXED, Math.round(srcH / ANALYSIS_CELL_PX));
+            const scoreColsUsed = Math.max(1, Math.ceil(analysisCols / ANALYSIS_COLS_PER_SCORE_COL));
+            const staffCount = Math.max(1, Math.ceil(analysisRows / PITCHES_PER_STAFF_FIXED));
+            const measureCount = Math.max(1, Math.ceil(scoreColsUsed / COLS_PER_MEASURE));
+            const scoreColsPadded = measureCount * COLS_PER_MEASURE;
+            return {
+                srcW, srcH,
+                analysisCols,
+                analysisRows,
+                scoreColsUsed,
+                scoreColsPadded,
+                analysisColsPerScoreCol: ANALYSIS_COLS_PER_SCORE_COL,
+                staffCount,
+                pitchesPerStaff: PITCHES_PER_STAFF_FIXED,
+                measureCount,
+                colsPerMeasure: COLS_PER_MEASURE,
+                measureWidth: MEASURE_WIDTH,
+                staffGap: STAFF_GAP,
+                staffBand: STAFF_BAND,
+                topMargin: TOP_MARGIN,
+                bottomMargin: BOTTOM_MARGIN,
+                scoreWidth: measureCount * MEASURE_WIDTH,
+                scoreHeight: TOP_MARGIN + staffCount * STAFF_BAND + BOTTOM_MARGIN,
+            };
+        }
+
+        const STAVE_X_OFFSET = 0;
+
+        function handleFileSelect(event) {
+            const f = event.target.files[0];
+            if (f) processFile(f);
+        }
+        function handleDrop(event) {
+            dragover.value = false;
+            const f = event.dataTransfer.files[0];
+            if (f && f.type.startsWith('image/')) processFile(f);
+        }
+
+        async function processFile(file) {
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                const img = new Image();
+                img.onload = async () => {
+                    sourceImage.value = img;
+                    await nextTick();
+                    prepareImageState(img);
+                    stats.value = null;
+                    const container = vexflowContainer.value;
+                    if (container) container.innerHTML = '';
+                    updateThresholdPreview();
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function prepareImageState(img) {
+            const srcW = img.naturalWidth || img.width;
+            const srcH = img.naturalHeight || img.height;
+            const temp = document.createElement('canvas');
+            temp.width = srcW;
+            temp.height = srcH;
+            const tctx = temp.getContext('2d');
+            tctx.drawImage(img, 0, 0, srcW, srcH);
+            const imageData = tctx.getImageData(0, 0, srcW, srcH);
+            const gray = new Float32Array(srcW * srcH);
+            for (let i = 0; i < srcW * srcH; i++) {
+                gray[i] = 0.299 * imageData.data[i * 4] + 0.587 * imageData.data[i * 4 + 1] + 0.114 * imageData.data[i * 4 + 2];
+            }
+            imageState.value = { img, srcW, srcH, gray };
+            const t = otsu(gray);
+            autoThreshold.value = t;
+            threshold.value = t;
+            drawOriginalPreview(img, srcW, srcH);
+        }
+
+        function drawOriginalPreview(img, w, h) {
+            const origC = originalCanvas.value;
+            const segC = segmentCanvas.value;
+            const edgeC = edgeCanvas.value;
+            if (!origC || !segC || !edgeC) return;
+            origC.width = w;
+            origC.height = h;
+            segC.width = w;
+            segC.height = h;
+            edgeC.width = w;
+            edgeC.height = h;
+            const ctx = origC.getContext('2d');
+            ctx.clearRect(0, 0, w, h);
+            ctx.drawImage(img, 0, 0, w, h);
+            segC.getContext('2d').clearRect(0, 0, w, h);
+        }
+
+        function drawBinaryPreview() {
+            const state = imageState.value;
+            const edgeC = edgeCanvas.value;
+            if (!state || !edgeC) return;
+            const { srcW, srcH, gray } = state;
+            edgeC.width = srcW;
+            edgeC.height = srcH;
+            const edgeCtx = edgeC.getContext('2d');
+            edgeCtx.fillStyle = '#000';
+            edgeCtx.fillRect(0, 0, srcW, srcH);
+            const outImg = edgeCtx.createImageData(srcW, srcH);
+            const t = Number(threshold.value);
+            for (let i = 0; i < srcW * srcH; i++) {
+                const v = gray[i] < t ? 255 : 0;
+                outImg.data[i * 4] = v;
+                outImg.data[i * 4 + 1] = v;
+                outImg.data[i * 4 + 2] = v;
+                outImg.data[i * 4 + 3] = 255;
+            }
+            edgeCtx.putImageData(outImg, 0, 0);
+        }
+
+        function updateThresholdPreview() {
+            if (!imageState.value) return;
+            drawBinaryPreview();
+        }
+
+        async function renderScoreFromCurrentImage() {
+            if (!sourceImage.value) return;
+            await nextTick();
+            await processAndRender(sourceImage.value, Number(threshold.value));
+        }
+
+        function otsu(gray) {
+            const hist = new Array(256).fill(0);
+            gray.forEach(v => hist[Math.round(v)]++);
+            const total = gray.length;
+            let sum = 0;
+            for (let i = 0; i < 256; i++) sum += i * hist[i];
+            let sumB = 0, wB = 0, maxVar = 0, threshold = 127;
+            for (let i = 0; i < 256; i++) {
+                wB += hist[i];
+                if (wB === 0) continue;
+                const wF = total - wB;
+                if (wF === 0) break;
+                sumB += i * hist[i];
+                const mB = sumB / wB;
+                const mF = (sum - sumB) / wF;
+                const varBetween = wB * wF * (mB - mF) * (mB - mF);
+                if (varBetween > maxVar) { maxVar = varBetween; threshold = i; }
+            }
+            return threshold;
+        }
+
+        function sobel(gray, w, h, threshold) {
+            const edges = new Float32Array(w * h);
+            const sobelX = [-1,0,1,-2,0,2,-1,0,1];
+            const sobelY = [-1,-2,-1,0,0,0,1,2,1];
+            for (let y = 1; y < h - 1; y++) {
+                for (let x = 1; x < w - 1; x++) {
+                    let gx = 0, gy = 0;
+                    for (let ky = -1; ky <= 1; ky++) {
+                        for (let kx = -1; kx <= 1; kx++) {
+                            const idx = (y + ky) * w + (x + kx);
+                            const si = (ky + 1) * 3 + (kx + 1);
+                            gx += gray[idx] * sobelX[si];
+                            gy += gray[idx] * sobelY[si];
+                        }
+                    }
+                    const mag = Math.sqrt(gx * gx + gy * gy);
+                    edges[y * w + x] = mag > threshold ? 255 : 0;
+                }
+            }
+            return edges;
+        }
+
+        async function processAndRender(img, binaryThreshold) {
+            const origC = originalCanvas.value;
+            const segC = segmentCanvas.value;
+            const edgeC = edgeCanvas.value;
+            if (!origC || !segC || !edgeC) return;
+
+            const state = imageState.value;
+            const srcW = state?.srcW ?? img.naturalWidth ?? img.width;
+            const srcH = state?.srcH ?? img.naturalHeight ?? img.height;
+            const gray = state?.gray ?? (() => {
+                const temp = document.createElement('canvas');
+                temp.width = srcW; temp.height = srcH;
+                const tctx = temp.getContext('2d');
+                tctx.drawImage(img, 0, 0, srcW, srcH);
+                const imageData = tctx.getImageData(0, 0, srcW, srcH);
+                const arr = new Float32Array(srcW * srcH);
+                for (let i = 0; i < srcW * srcH; i++) {
+                    arr[i] = 0.299 * imageData.data[i * 4] + 0.587 * imageData.data[i * 4 + 1] + 0.114 * imageData.data[i * 4 + 2];
+                }
+                return arr;
+            })();
+            const layout = buildLayout(srcW, srcH);
+            const HD_W = srcW, HD_H = srcH;
+            const ANALYSIS_GRID_X = layout.analysisCols;
+            const ANALYSIS_GRID_Y = layout.analysisRows;
+            const SCORE_GRID_X = layout.scoreColsUsed;
+            const NUM_STAVES = layout.staffCount;
+            const PITCHES_PER_STAFF = layout.pitchesPerStaff;
+            const PITCHES_PER_STAVE = PITCHES_PER_STAFF; // backward-compat alias for any leftover references
+            const ANALYSIS_COLS_PER_SCORE_COL = layout.analysisColsPerScoreCol;
+            const PITCH_TABLE = buildPitchTable(NUM_STAVES);
+
+            drawOriginalPreview(img, HD_W, HD_H);
+            drawBinaryPreview();
+            const effectiveThreshold = Number.isFinite(binaryThreshold) ? binaryThreshold : Number(threshold.value);
+
+            const cellW = HD_W / ANALYSIS_GRID_X;
+            const pitchH = HD_H / ANALYSIS_GRID_Y;
+
+            // ============================================================
+            // 境界線 -> グリッド上の折れ線
+            // ------------------------------------------------------------
+            // 【旧実装の問題点】列ごとに白黒の切替点を「独立に」検出し、
+            // 前の列の点との高さの近さだけを頼りに後からつなぎ直して
+            // いた。これだと「どのピクセルとどのピクセルが実際に輪郭上で
+            // 隣り合っているか」という情報を一度捨てて推測し直すことになり、
+            // 輪郭が分岐・交差して見える場所（髪、肩、腕の付け根など）で
+            // 対応付けが破綻し、無関係な点同士が線でつながって赤線が
+            // 画面を斜めに横切るバグになっていた。
+            //
+            // 【新実装】Moore-Neighbor法による本物の境界追跡を行う。
+            // 二値マスクの連結成分ごとに、輪郭ピクセルを「実際にたどった
+            // 順番」で1周分取得する。順序が最初から保証されているので、
+            // 後から高さで対応付け直す必要がなく、無関係な点がつながる
+            // ことがない。腕とドレスの間の白い隙間のような「穴」も、
+            // 背景側の連結成分として検出し、内側の輪郭として追跡する。
+            // ============================================================
+
+            // ユーザーがスライダーで調整した二値化閾値を使う。
+            const mask = new Uint8Array(HD_W * HD_H);
+            for (let i = 0; i < gray.length; i++) {
+                mask[i] = gray[i] < effectiveThreshold ? 1 : 0;
+            }
+            // 画像ファイル自体の外枠は輪郭として扱わない。
+            // 最外周1pxは強制的に背景へ落として、上辺・下辺・左辺・右辺に沿う
+            // 擬似的な境界線が trace されないようにする。
+            for (let x = 0; x < HD_W; x++) {
+                mask[x] = 0;
+                mask[(HD_H - 1) * HD_W + x] = 0;
+            }
+            for (let y = 0; y < HD_H; y++) {
+                mask[y * HD_W] = 0;
+                mask[y * HD_W + (HD_W - 1)] = 0;
+            }
+
+            // ノイズ的な極小領域（ゴミピクセル）は輪郭追跡の対象外にする。
+            const MIN_COMPONENT_AREA = 30;
+            // 全体で処理する連結成分数の上限（ノイズの多い写真での暴走防止）。
+            const MAX_COMPONENTS = 300;
+
+            function isFG(x, y) {
+                if (x < 0 || y < 0 || x >= HD_W || y >= HD_H) return false;
+                return mask[y * HD_W + x] === 1;
+            }
+
+            // ---- 連結成分検出（4近傍）。前景(1)・背景(0)どちらにも使う。 ----
+            // 戻り値の各要素は、その成分内で「最初に見つかった」ピクセル
+            // （＝走査順序上、最も上・その中で最も左のピクセル）を
+            // startX/startY として持つ。これは境界追跡の開始点として
+            // そのまま使える（すぐ左が必ず別の値になっているため）。
+            // connectivity: 4 または 8。
+            // 【重要】前景の連結判定と境界追跡（Moore-Neighbor、8方向）の
+            // 連結規則が食い違うと、斜め1点だけで触れ合っている領域
+            // （髪先の分岐など）で追跡が本来の輪郭から漏れ出し、無関係な
+            // 別の領域を延々とさまようバグになる。これを避けるため、
+            // 前景(黒領域)は8連結、背景側の穴判定は4連結、と使い分ける
+            // （二値画像の輪郭解析における標準的な組み合わせ）。
+            function findComponents(value, connectivity) {
+                const labels = new Int32Array(HD_W * HD_H).fill(-1);
+                const stack = new Int32Array(HD_W * HD_H);
+                const comps = [];
+                const diag = connectivity === 8;
+                for (let y = 0; y < HD_H; y++) {
+                    for (let x = 0; x < HD_W; x++) {
+                        const startIdx = y * HD_W + x;
+                        if (mask[startIdx] !== value || labels[startIdx] !== -1) continue;
+
+                        let sp = 0;
+                        stack[sp++] = startIdx;
+                        labels[startIdx] = 1;
+                        let count = 0;
+                        let touchesBorder = false;
+
+                        while (sp > 0) {
+                            const cur = stack[--sp];
+                            const cx = cur % HD_W, cy = (cur / HD_W) | 0;
+                            count++;
+                            if (cx === 0 || cy === 0 || cx === HD_W - 1 || cy === HD_H - 1) touchesBorder = true;
+                            const xLo = cx > 0, xHi = cx < HD_W - 1, yLo = cy > 0, yHi = cy < HD_H - 1;
+                            if (xLo) { const n = cur - 1; if (mask[n] === value && labels[n] === -1) { labels[n] = 1; stack[sp++] = n; } }
+                            if (xHi) { const n = cur + 1; if (mask[n] === value && labels[n] === -1) { labels[n] = 1; stack[sp++] = n; } }
+                            if (yLo) { const n = cur - HD_W; if (mask[n] === value && labels[n] === -1) { labels[n] = 1; stack[sp++] = n; } }
+                            if (yHi) { const n = cur + HD_W; if (mask[n] === value && labels[n] === -1) { labels[n] = 1; stack[sp++] = n; } }
+                            if (diag) {
+                                if (xLo && yLo) { const n = cur - HD_W - 1; if (mask[n] === value && labels[n] === -1) { labels[n] = 1; stack[sp++] = n; } }
+                                if (xHi && yLo) { const n = cur - HD_W + 1; if (mask[n] === value && labels[n] === -1) { labels[n] = 1; stack[sp++] = n; } }
+                                if (xLo && yHi) { const n = cur + HD_W - 1; if (mask[n] === value && labels[n] === -1) { labels[n] = 1; stack[sp++] = n; } }
+                                if (xHi && yHi) { const n = cur + HD_W + 1; if (mask[n] === value && labels[n] === -1) { labels[n] = 1; stack[sp++] = n; } }
+                            }
+                        }
+
+                        comps.push({ startX: x, startY: y, count, touchesBorder });
+                    }
+                }
+                return comps;
+            }
+
+            // ---- Moore-Neighbor境界追跡（時計回り8方向） ----
+            const DIRS8 = [
+                { dx: -1, dy: 0 }, { dx: -1, dy: -1 }, { dx: 0, dy: -1 }, { dx: 1, dy: -1 },
+                { dx: 1, dy: 0 }, { dx: 1, dy: 1 }, { dx: 0, dy: 1 }, { dx: -1, dy: 1 }
+            ];
+            function dirIndexOf(dx, dy) {
+                for (let i = 0; i < 8; i++) if (DIRS8[i].dx === dx && DIRS8[i].dy === dy) return i;
+                return 0;
+            }
+            // startX,startYから追跡を開始する。backDx/backDyは「開始点の
+            // 直前（背景側）はどちらの方向か」を示す（外周なら西、
+            // 穴の内側なら東、というように追跡の種類で決まる）。
+            function traceBoundary(sx, sy, backDx, backDy, maxSteps) {
+                const points = [{ x: sx, y: sy }];
+                let cx = sx, cy = sy;
+                let bIdx = dirIndexOf(backDx, backDy);
+                // (座標, 戻り方向) の状態集合。同じ状態に戻ってきたら、その先は
+                // 必ず同じ経路を繰り返すだけなので、そこで打ち切れば必ず停止する
+                // （「開始ピクセルに戻ったら終了」だけだと、自己接触する輪郭で
+                // 　一周が完了しないまま無関係な領域へ迷い込む恐れがあるため）。
+                const seen = new Set();
+                let steps = 0;
+                while (steps++ < maxSteps) {
+                    const stateKey = cx * 8 + bIdx + cy * HD_W * 8;
+                    if (seen.has(stateKey)) break;
+                    seen.add(stateKey);
+
+                    let found = -1;
+                    for (let k = 1; k <= 8; k++) {
+                        const idx = (bIdx + k) % 8;
+                        const nx = cx + DIRS8[idx].dx, ny = cy + DIRS8[idx].dy;
+                        if (isFG(nx, ny)) { found = idx; break; }
+                    }
+                    if (found === -1) break; // 孤立ピクセル
+
+                    // 新しい現在地から見た「戻り方向」は、前景が見つかる一つ手前
+                    // （背景側）に調べたピクセルの実座標との差から直接求める。
+                    // （方向インデックスの単純な算術（例: (found+6)%8）だけでは
+                    // 　斜め方向で見つかった場合に誤った値になることを確認済み）
+                    const prevIdx = (found + 7) % 8;
+                    const prevX = cx + DIRS8[prevIdx].dx;
+                    const prevY = cy + DIRS8[prevIdx].dy;
+                    cx += DIRS8[found].dx;
+                    cy += DIRS8[found].dy;
+                    bIdx = dirIndexOf(prevX - cx, prevY - cy);
+                    points.push({ x: cx, y: cy });
+                }
+                return points;
+            }
+
+            // ---- 前景の外周・背景側の穴（境界に接しない背景領域）を抽出 ----
+            // 前景は8連結、背景(穴)は4連結（上のfindComponentsの説明を参照）。
+            let fgComps = findComponents(1, 8).filter(c => c.count >= MIN_COMPONENT_AREA);
+            let bgComps = findComponents(0, 4).filter(c => !c.touchesBorder && c.count >= MIN_COMPONENT_AREA);
+            fgComps.sort((a, b) => b.count - a.count);
+            bgComps.sort((a, b) => b.count - a.count);
+            if (fgComps.length > MAX_COMPONENTS) fgComps = fgComps.slice(0, MAX_COMPONENTS);
+            if (bgComps.length > MAX_COMPONENTS) bgComps = bgComps.slice(0, MAX_COMPONENTS);
+
+            const rawTraces = [];
+            for (const c of fgComps) {
+                // 外周: 走査順で最初に見つかる点＝最上段・最左のピクセル。
+                // その直前（左側）は必ず背景なので、開始の戻り方向は「西」。
+                const maxSteps = Math.max(2000, c.count * 8);
+                const pts = traceBoundary(c.startX, c.startY, -1, 0, maxSteps);
+                if (pts.length >= 2) rawTraces.push(pts);
+            }
+            for (const c of bgComps) {
+                // 穴: 最上段・最左の背景ピクセルのすぐ左は必ず前景ピクセル。
+                // そこを開始点とし、戻り方向は「東（穴側）」にする。
+                const fx = c.startX - 1, fy = c.startY;
+                if (!isFG(fx, fy)) continue;
+                const maxSteps = Math.max(2000, c.count * 8);
+                const pts = traceBoundary(fx, fy, 1, 0, maxSteps);
+                if (pts.length >= 2) rawTraces.push(pts);
+            }
+
+            // ------------------------------------------------------------
+            // 追跡した輪郭をそのままグリッドへ落とし込む。
+            //
+            // 以前は「同じ列に入った輪郭点を平均して1点に潰す」ことで、
+            // ほぼ垂直な輪郭や、同じ列を複数回通る細かな凹凸が失われていた。
+            // そのため、赤い折れ線が境界線を十分にカバーできていなかった。
+            //
+            // ここでは輪郭上の連続点を直接グリッド化し、さらに連続する2点間を
+            // グリッド上でBresenham補間して、通過したグリッドセルを漏れなく保持する。
+            // こうすると、細かな段差や縦寄りの輪郭でも「通ったセル」が欠落しにくい。
+            // ------------------------------------------------------------
+            function clampInt(v, lo, hi) {
+                return Math.max(lo, Math.min(hi, v));
+            }
+
+            function rasterizeGridLine(x0, y0, x1, y1) {
+                const pts = [];
+                let cx = x0, cy = y0;
+                const dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+                const dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+                let err = dx + dy;
+                while (true) {
+                    pts.push({ x: cx, gy: cy });
+                    if (cx === x1 && cy === y1) break;
+                    const e2 = 2 * err;
+                    if (e2 >= dy) { err += dy; cx += sx; }
+                    if (e2 <= dx) { err += dx; cy += sy; }
+                }
+                return pts;
+            }
+
+            const rawSegments = [];
+            for (const pts of rawTraces) {
+                if (!pts || pts.length < 2) continue;
+
+                // まず輪郭ピクセル列をグリッド点列へ量子化する。
+                const quantized = [];
+                for (const p of pts) {
+                    const qx = clampInt(Math.floor(p.x / cellW), 0, ANALYSIS_GRID_X - 1);
+                    const qy = clampInt(Math.round(p.y / pitchH), 0, ANALYSIS_GRID_Y - 1);
+                    const last = quantized[quantized.length - 1];
+                    if (!last || last.x !== qx || last.gy !== qy) {
+                        quantized.push({ x: qx, gy: qy });
+                    }
+                }
+                if (quantized.length < 2) continue;
+
+                // 量子化で飛んだセルをBresenhamで補間し、輪郭が通ったセルを保持する。
+                const path = [];
+                for (let i = 1; i < quantized.length; i++) {
+                    const a = quantized[i - 1];
+                    const b = quantized[i];
+                    const sub = rasterizeGridLine(a.x, a.gy, b.x, b.gy);
+                    for (let j = 0; j < sub.length; j++) {
+                        if (path.length > 0 && j === 0) {
+                            const last = path[path.length - 1];
+                            if (last.x === sub[j].x && last.gy === sub[j].gy) continue;
+                        }
+                        path.push(sub[j]);
+                    }
+                }
+                if (path.length < 2) continue;
+
+                // A→B→A の1ステップ往復を除去して、量子化由来の細かい震えを軽減する。
+                const cleaned = [];
+                for (const p of path) {
+                    if (cleaned.length >= 2) {
+                        const a = cleaned[cleaned.length - 2];
+                        const b = cleaned[cleaned.length - 1];
+                        if (a.x === p.x && a.gy === p.gy && !(b.x === p.x && b.gy === p.gy)) {
+                            cleaned.pop();
+                            continue;
+                        }
+                    }
+                    const last = cleaned[cleaned.length - 1];
+                    if (!last || last.x !== p.x || last.gy !== p.gy) cleaned.push(p);
+                }
+                if (cleaned.length < 2) continue;
+
+                // 画像ファイルの外枠に対応するグリッド端は輪郭として使わない。
+                // 端セルを通る点は捨て、そこで輪郭を分断する。
+                const interiorFragments = [];
+                let frag = [];
+                const flushFrag = () => {
+                    if (frag.length >= 2) interiorFragments.push(frag);
+                    frag = [];
+                };
+                for (const p of cleaned) {
+                    const onGridBorder = (
+                        p.x <= 0 || p.x >= ANALYSIS_GRID_X - 1 ||
+                        p.gy <= 0 || p.gy >= ANALYSIS_GRID_Y - 1
+                    );
+                    if (onGridBorder) {
+                        flushFrag();
+                        continue;
+                    }
+                    const last = frag[frag.length - 1];
+                    if (!last || last.x !== p.x || last.gy !== p.gy) frag.push(p);
+                }
+                flushFrag();
+
+                for (const interior of interiorFragments) {
+                    // 輪郭を左→右で読めるように、xの単調区間ごとに分割する。
+                    // 減少区間も反転して使うので、輪郭の片側が失われることはない。
+                    let run = [interior[0]];
+                    let dir = 0; // 1:増加 / -1:減少 / 0:未確定
+                    const flushRun = () => {
+                        if (run.length < 2) return;
+                        const firstX = run[0].x;
+                        const lastX = run[run.length - 1].x;
+                        if (firstX === lastX && run.length < 3) return;
+                        rawSegments.push(dir === -1 ? run.slice().reverse() : run.slice());
+                    };
+
+                    for (let i = 1; i < interior.length; i++) {
+                        const prev = interior[i - 1];
+                        const cur = interior[i];
+                        const dx = cur.x - prev.x;
+                        if (dx === 0) {
+                            run.push(cur);
+                            continue;
+                        }
+                        const curDir = dx > 0 ? 1 : -1;
+                        if (dir === 0) {
+                            dir = curDir;
+                            run.push(cur);
+                        } else if (curDir === dir) {
+                            run.push(cur);
+                        } else {
+                            flushRun();
+                            run = [prev, cur];
+                            dir = curDir;
+                        }
+                    }
+                    flushRun();
+                }
+            }
+
+            // 16五線へ分割。ただし staff 境界で前後の点を両側に保持し、
+            // 見た目の切れ目が出にくいようにする。
+            const segments = [];
+            for (const raw of rawSegments) {
+                let run = [];
+                let currentStaff = null;
+                let prevPoint = null;
+
+                for (const p of raw) {
+                    const staff = clampInt(Math.floor(p.gy / PITCHES_PER_STAFF), 0, NUM_STAVES - 1);
+                    const pitch = clampInt(p.gy - staff * PITCHES_PER_STAFF, 0, PITCHES_PER_STAFF - 1);
+                    const point = { x: p.x, pitch };
+
+                    if (currentStaff === null) {
+                        currentStaff = staff;
+                        run = [point];
+                    } else if (staff === currentStaff) {
+                        const last = run[run.length - 1];
+                        if (!last || last.x !== point.x || last.pitch !== point.pitch) run.push(point);
+                    } else {
+                        if (prevPoint) {
+                            const bridgePrevPitch = clampInt(prevPoint.gy - currentStaff * PITCHES_PER_STAFF, 0, PITCHES_PER_STAFF - 1);
+                            const last = run[run.length - 1];
+                            if (!last || last.x !== prevPoint.x || last.pitch !== bridgePrevPitch) {
+                                run.push({ x: prevPoint.x, pitch: bridgePrevPitch });
+                            }
+                        }
+                        if (run.length >= 2) segments.push({ staff: currentStaff, points: run });
+
+                        currentStaff = staff;
+                        const startRun = [];
+                        if (prevPoint) {
+                            const bridgeCurrPitch = clampInt(prevPoint.gy - currentStaff * PITCHES_PER_STAFF, 0, PITCHES_PER_STAFF - 1);
+                            startRun.push({ x: prevPoint.x, pitch: bridgeCurrPitch });
+                        }
+                        startRun.push(point);
+                        run = startRun;
+                    }
+                    prevPoint = p;
+                }
+
+                if (run.length >= 2) {
+                    segments.push({ staff: currentStaff, points: run });
+                }
+            }
+
+            // 解析256×144で得た線分を、元画像の上に赤で重ねる。
+            // 楽譜化の64列への縮約前なので、境界追跡・線分化そのものを確認できる。
+            const segCtx = segC.getContext('2d');
+            segCtx.clearRect(0, 0, HD_W, HD_H);
+            segCtx.strokeStyle = '#ff0000';
+            segCtx.lineWidth = 4;
+            segCtx.lineJoin = 'round';
+            segCtx.lineCap = 'round';
+            for (const seg of segments) {
+                if (!seg.points || seg.points.length < 2) continue;
+                const first = seg.points[0];
+                segCtx.beginPath();
+                segCtx.moveTo(
+                    first.x * cellW + cellW / 2,
+                    (seg.staff * PITCHES_PER_STAFF + first.pitch + 0.5) * pitchH
+                );
+                for (let i = 1; i < seg.points.length; i++) {
+                    const p = seg.points[i];
+                    segCtx.lineTo(
+                        p.x * cellW + cellW / 2,
+                        (seg.staff * PITCHES_PER_STAFF + p.pitch + 0.5) * pitchH
+                    );
+                }
+                segCtx.stroke();
+            }
+
+            // ============================================================
+            // 解析グリッド(256×144) -> 楽譜グリッド(64×144)
+            // ------------------------------------------------------------
+            // 横方向だけ4:1で量子化する。縦方向は144段をそのまま維持する。
+            // 同じ四分音符セルに複数の解析点が入る場合は、その4セル区間の中心に
+            // 最も近い解析点を代表値にする。単なる「最後の点」より輪郭形状を保ちやすい。
+            // ============================================================
+            const scoreSegments = [];
+            for (const seg of segments) {
+                if (!seg.points || seg.points.length < 2) continue;
+
+                const buckets = new Map();
+                for (const p of seg.points) {
+                    const sx = clampInt(
+                        Math.floor(p.x / ANALYSIS_COLS_PER_SCORE_COL),
+                        0,
+                        SCORE_GRID_X - 1
+                    );
+                    if (!buckets.has(sx)) buckets.set(sx, []);
+                    buckets.get(sx).push(p);
+                }
+
+                const scorePoints = [];
+                const sortedXs = Array.from(buckets.keys()).sort((a, b) => a - b);
+                for (const sx of sortedXs) {
+                    const candidates = buckets.get(sx);
+                    const centerAnalysisX = sx * ANALYSIS_COLS_PER_SCORE_COL
+                        + (ANALYSIS_COLS_PER_SCORE_COL - 1) / 2;
+                    let best = candidates[0];
+                    let bestDist = Math.abs(best.x - centerAnalysisX);
+                    for (let i = 1; i < candidates.length; i++) {
+                        const d = Math.abs(candidates[i].x - centerAnalysisX);
+                        if (d < bestDist) {
+                            best = candidates[i];
+                            bestDist = d;
+                        }
+                    }
+                    scorePoints.push({ x: sx, pitch: best.pitch });
+                }
+
+                if (scorePoints.length >= 2) {
+                    scoreSegments.push({ staff: seg.staff, points: scorePoints });
+                }
+            }
+
+            // ============================================================
+            // 同じ五線内の線分を、時間が重ならない限り同じvoiceへ詰める。
+            // ------------------------------------------------------------
+            // interval partitioning: 各staffごとに開始時刻順で線分を見て、
+            // すでに終了しているvoiceを再利用する。再利用できるvoiceが無い場合だけ
+            // 新しいvoiceを追加するため、必要声部数はそのstaffで同時に存在する
+            // 線分数（最大重なり数）まで圧縮される。
+            // ============================================================
+            const voiceEndsByStaff = Array.from({ length: NUM_STAVES }, () => []);
+            const voiceAssignOrder = scoreSegments.slice().sort((a, b) => {
+                const aStart = Math.min(...a.points.map(p => p.x));
+                const bStart = Math.min(...b.points.map(p => p.x));
+                if (a.staff !== b.staff) return a.staff - b.staff;
+                if (aStart !== bStart) return aStart - bStart;
+                const aEnd = Math.max(...a.points.map(p => p.x));
+                const bEnd = Math.max(...b.points.map(p => p.x));
+                return aEnd - bEnd;
+            });
+
+            for (const seg of voiceAssignOrder) {
+                const startX = Math.min(...seg.points.map(p => p.x));
+                const endExclusive = Math.max(...seg.points.map(p => p.x)) + 1;
+                const voiceEnds = voiceEndsByStaff[seg.staff];
+
+                let chosenVoice = -1;
+                let latestReusableEnd = -Infinity;
+                for (let v = 0; v < voiceEnds.length; v++) {
+                    // endExclusive <= startX なら時間区間は重ならない。
+                    if (voiceEnds[v] <= startX && voiceEnds[v] > latestReusableEnd) {
+                        chosenVoice = v;
+                        latestReusableEnd = voiceEnds[v];
+                    }
+                }
+
+                if (chosenVoice === -1) {
+                    chosenVoice = voiceEnds.length;
+                    voiceEnds.push(endExclusive);
+                } else {
+                    voiceEnds[chosenVoice] = endExclusive;
+                }
+
+                seg.voice = chosenVoice;
+                seg.startX = startX;
+                seg.endExclusive = endExclusive;
+            }
+
+            const totalVoices = voiceEndsByStaff.reduce((sum, voices) => sum + voices.length, 0);
+
+            // ============================================================
+            // 折れ線 -> 楽譜イベント
+            // ------------------------------------------------------------
+            // 重要: 「音符の存在するグリッドだけを1拍ずつ置き、間を休符で埋める」
+            // のではなく、StaveLineで結ばれる2つのアンカー音の間隔を、前側の
+            // 音符の音価として使う。
+            // 例: x=0 の音 -> x=3 の音 が1本の線で結ばれる場合、
+            //     四分音符 + 四分休符 + 四分休符 + 四分音符
+            // ではなく、付点二分音符 + 四分音符 とする。
+            // ============================================================
+            const noteEvents = [];
+            const staveLines = [];
+            const tieLines = [];
+
+            function durationSpecFromBeats(beats) {
+                if (beats >= 4) return { duration: 'w', dots: 0, beats: 4 };
+                if (beats === 3) return { duration: 'h', dots: 1, beats: 3 };
+                if (beats === 2) return { duration: 'h', dots: 0, beats: 2 };
+                return { duration: 'q', dots: 0, beats: 1 };
+            }
+
+            function splitBeatsToDurationSpecs(totalBeats) {
+                const specs = [];
+                let remaining = totalBeats;
+                while (remaining > 0) {
+                    const spec = durationSpecFromBeats(remaining);
+                    specs.push(spec);
+                    remaining -= spec.beats;
+                }
+                return specs;
+            }
+
+            function quantizePitch(p) {
+                return clampInt(Math.round(p), 0, PITCHES_PER_STAFF - 1);
+            }
+
+            function interpolatePitch(aPitch, bPitch, aX, bX, x) {
+                if (bX <= aX) return quantizePitch(aPitch);
+                const t = (x - aX) / (bX - aX);
+                return quantizePitch(aPitch + (bPitch - aPitch) * t);
+            }
+
+            let eventId = 0;
+
+            for (const seg of scoreSegments) {
+                if (!seg.points || seg.points.length < 1) continue;
+                const staff = seg.staff;
+                const voice = seg.voice ?? 0;
+
+                const ordered = seg.points
+                    .map(p => ({ x: p.x, pitch: Math.round(p.pitch) }))
+                    .filter(p => p.x >= 0 && p.x < SCORE_GRID_X && p.pitch >= 0 && p.pitch < PITCHES_PER_STAFF)
+                    .sort((a, b) => a.x - b.x || a.pitch - b.pitch);
+
+                const points = [];
+                for (const p of ordered) {
+                    const last = points[points.length - 1];
+                    if (last && last.x === p.x && last.pitch === p.pitch) continue;
+                    points.push({ ...p });
+                }
+                if (points.length === 0) continue;
+
+                // pitch が一定の連続区間を run として抽出する。
+                // 水平線分も開始音だけでなく終了音を作るため、各 run は start/end 両端を anchor 化する。
+                const runs = [];
+                let runStartX = points[0].x;
+                let runEndX = points[0].x;
+                let runPitch = points[0].pitch;
+                for (let i = 1; i < points.length; i++) {
+                    const p = points[i];
+                    if (p.pitch === runPitch && p.x <= runEndX + 1) {
+                        runEndX = p.x;
+                    } else {
+                        runs.push({ x0: runStartX, x1: runEndX, pitch: runPitch });
+                        runStartX = p.x;
+                        runEndX = p.x;
+                        runPitch = p.pitch;
+                    }
+                }
+                runs.push({ x0: runStartX, x1: runEndX, pitch: runPitch });
+
+                const anchors = [];
+                for (const run of runs) {
+                    anchors.push({ x: run.x0, pitch: run.pitch, sampledEndX: run.x1, originalX: run.x0 });
+                    if (run.x1 > run.x0) {
+                        anchors.push({ x: run.x1, pitch: run.pitch, sampledEndX: run.x1, originalX: run.x1 });
+                    }
+                }
+                anchors.sort((a, b) => a.x - b.x || a.pitch - b.pitch);
+
+                const normalizedAnchors = [];
+                for (const a of anchors) {
+                    const last = normalizedAnchors[normalizedAnchors.length - 1];
+                    if (last && last.x === a.x && last.pitch === a.pitch) {
+                        last.sampledEndX = Math.max(last.sampledEndX, a.sampledEndX);
+                    } else {
+                        normalizedAnchors.push({ ...a });
+                    }
+                }
+
+                // x が同じ、または逆行する anchor は、1拍ぶんだけ右へずらして
+                // 「ほぼ垂直な極短の斜線」として扱う。
+                const scheduledAnchors = [];
+                for (const a of normalizedAnchors) {
+                    const prev = scheduledAnchors[scheduledAnchors.length - 1];
+                    let scheduledX = a.x;
+                    let approxVerticalFromPrev = false;
+                    if (prev && scheduledX <= prev.x) {
+                        scheduledX = prev.x + 1;
+                        approxVerticalFromPrev = true;
+                    }
+                    scheduledAnchors.push({
+                        ...a,
+                        x: scheduledX,
+                        approxVerticalFromPrev,
+                        originalX: a.originalX ?? a.x,
+                    });
+                }
+
+                const anchorFirstEventIds = [];
+                for (let a = 0; a < scheduledAnchors.length; a++) {
+                    const anchor = scheduledAnchors[a];
+                    const next = scheduledAnchors[a + 1];
+                    const spanEndExclusive = next
+                        ? Math.max(anchor.x + 1, next.x)
+                        : Math.max(anchor.x + 1, anchor.sampledEndX + 1);
+                    let remainingBeats = Math.max(1, spanEndExclusive - anchor.x);
+                    let cursorX = anchor.x;
+                    let firstId = null;
+                    let prevChunkId = null;
+
+                    const anchorHasGlissTarget = !!next;
+                    while (remainingBeats > 0) {
+                        const measureBeat = cursorX % COLS_PER_MEASURE;
+                        const room = COLS_PER_MEASURE - measureBeat;
+                        const beatsThisMeasure = Math.min(remainingBeats, room);
+                        const specs = splitBeatsToDurationSpecs(beatsThisMeasure);
+
+                        for (const spec of specs) {
+                            const isFirstChunk = firstId === null;
+                            const renderedPitch = anchorHasGlissTarget && !isFirstChunk
+                                ? interpolatePitch(anchor.pitch, next.pitch, anchor.x, next.x, cursorX)
+                                : anchor.pitch;
+                            const midi = PITCH_TABLE[staff]?.[renderedPitch];
+                            if (midi === undefined) break;
+
+                            const ev = {
+                                id: eventId++,
+                                staff,
+                                voice,
+                                measure: Math.floor(cursorX / COLS_PER_MEASURE),
+                                xStart: cursorX,
+                                xEndExclusive: cursorX + spec.beats,
+                                pitch: renderedPitch,
+                                midi,
+                                durationBeats: spec.beats,
+                                duration: spec.duration,
+                                dots: spec.dots,
+                                hideNotehead: anchorHasGlissTarget && !isFirstChunk,
+                                isContinuationChunk: anchorHasGlissTarget && !isFirstChunk
+                            };
+                            noteEvents.push(ev);
+                            if (firstId === null) firstId = ev.id;
+                            if (prevChunkId !== null && !anchorHasGlissTarget) {
+                                tieLines.push({ fromEventId: prevChunkId, toEventId: ev.id });
+                            }
+                            prevChunkId = ev.id;
+                            cursorX += spec.beats;
+                            remainingBeats -= spec.beats;
+                        }
+                    }
+                    anchorFirstEventIds.push(firstId);
+                }
+
+                for (let a = 0; a + 1 < scheduledAnchors.length; a++) {
+                    const fromEventId = anchorFirstEventIds[a];
+                    const toEventId = anchorFirstEventIds[a + 1];
+                    if (fromEventId !== null && toEventId !== null) {
+                        const dx = scheduledAnchors[a + 1].x - scheduledAnchors[a].x;
+                        const dy = Math.abs(scheduledAnchors[a + 1].pitch - scheduledAnchors[a].pitch);
+                        staveLines.push({
+                            fromEventId,
+                            toEventId,
+                            staff,
+                            voice,
+                            approxVertical: scheduledAnchors[a + 1].approxVerticalFromPrev || (dx <= 1 && dy >= 2)
+                        });
+                    }
+                }
+            }
+
+            const actualScoreColsUsed = Math.max(1, ...noteEvents.map(ev => ev.xEndExclusive || (ev.xStart + 1)), 0);
+            const actualMeasureCount = Math.max(1, Math.ceil(actualScoreColsUsed / COLS_PER_MEASURE));
+            // 右側の余白も含めて、元画像の横幅から決まる score grid / measure 数は保持する。
+            // ただし near-vertical 近似の都合で最終イベントが1拍ぶん右へはみ出した場合だけは、
+            // 必要最小限だけ拡張する。
+            const renderMeasureCount = Math.max(layout.measureCount, actualMeasureCount);
+            const renderLayout = {
+                ...layout,
+                scoreColsUsed: layout.scoreColsUsed,
+                measureCount: renderMeasureCount,
+                scoreColsPadded: renderMeasureCount * COLS_PER_MEASURE,
+                scoreWidth: renderMeasureCount * MEASURE_WIDTH,
+                scoreHeight: TOP_MARGIN + layout.staffCount * STAFF_BAND + BOTTOM_MARGIN
+            };
+
+            stats.value = {
+                segments: segments.length,
+                scoreSegments: scoreSegments.length,
+                voices: totalVoices,
+                noteEvents: noteEvents.length,
+                stavelines: staveLines.length,
+                measures: renderLayout.measureCount,
+                staves: renderLayout.staffCount,
+                analysisCols: layout.analysisCols,
+                analysisRows: layout.analysisRows
+            };
+
+            renderVexFlow(noteEvents, staveLines, tieLines, renderLayout);
+        }
+
+        function renderVexFlow(noteEvents, staveLines, tieLines = [], layout) {
+            const container = vexflowContainer.value;
+            const viewport = scoreViewport.value;
+            if (!container || !viewport) return;
+            container.innerHTML = '';
+
+            const canvasWidth = layout.scoreWidth;
+            const canvasHeight = layout.scoreHeight;
+            const NUM_STAVES = layout.staffCount;
+            const PITCHES_PER_STAFF = layout.pitchesPerStaff;
+            const PITCHES_PER_STAVE = PITCHES_PER_STAFF; // backward-compat alias
+            const SCORE_GRID_X = layout.scoreColsPadded;
+            const COLS_PER_MEASURE = layout.colsPerMeasure;
+            const MEASURE_WIDTH = layout.measureWidth;
+            const STAVE_Y_START = layout.topMargin;
+            const STAVE_SPACING = layout.staffBand;
+            const renderer = new Vex.Flow.Renderer(container, Vex.Flow.Renderer.Backends.SVG);
+            renderer.resize(canvasWidth, canvasHeight);
+            const context = renderer.getContext();
+
+            const staveList = [];
+            const numMeasures = layout.measureCount;
+            for (let s = 0; s < NUM_STAVES; s++) {
+                staveList[s] = [];
+                for (let m = 0; m < numMeasures; m++) {
+                    const x = STAVE_X_OFFSET + m * MEASURE_WIDTH;
+                    const y = STAVE_Y_START + s * STAVE_SPACING;
+                    const stave = new Vex.Flow.Stave(x, y, MEASURE_WIDTH);
+                    if (m === 0) stave.addClef('treble').addTimeSignature('4/4');
+                    else stave.setEndBarType(Vex.Flow.Barline.type.NONE);
+                    stave.setContext(context).draw();
+                    staveList[s][m] = stave;
+                }
+            }
+
+            function durationSpecFromBeats(beats) {
+                if (beats >= 4) return { duration: 'wr', dots: 0, beats: 4 };
+                if (beats === 3) return { duration: 'hr', dots: 1, beats: 3 };
+                if (beats === 2) return { duration: 'hr', dots: 0, beats: 2 };
+                return { duration: 'qr', dots: 0, beats: 1 };
+            }
+
+            function splitBeatsToRestSpecs(totalBeats) {
+                const specs = [];
+                let remaining = totalBeats;
+                while (remaining > 0) {
+                    const spec = durationSpecFromBeats(remaining);
+                    specs.push(spec);
+                    remaining -= spec.beats;
+                }
+                return specs;
+            }
+
+            function addDots(note, count) {
+                for (let i = 0; i < count; i++) {
+                    Vex.Flow.Dot.buildAndAttach([note], { all: true });
+                }
+            }
+
+            function makeSpacerTickables(beats) {
+                const out = [];
+                for (const spec of splitBeatsToRestSpecs(beats)) {
+                    const rest = new Vex.Flow.StaveNote({ keys: ['b/4'], duration: spec.duration });
+                    if (spec.dots) addDots(rest, spec.dots);
+                    out.push(rest);
+                }
+                return out;
+            }
+
+            function hideNoteheadKeepStem(note) {
+                try {
+                    if (typeof note.setKeyStyle === 'function') {
+                        note.setKeyStyle(0, { fillStyle: 'rgba(0,0,0,0)', strokeStyle: 'rgba(0,0,0,0)' });
+                    }
+                } catch (e) {}
+                const noteHeads = note.noteHeads || note.note_heads || [];
+                for (const nh of noteHeads) {
+                    try { if (nh && typeof nh.setStyle === 'function') nh.setStyle({ fillStyle: 'rgba(0,0,0,0)', strokeStyle: 'rgba(0,0,0,0)' }); } catch (e) {}
+                }
+                try { if (typeof note.setLedgerLineStyle === 'function') note.setLedgerLineStyle({ strokeStyle: 'rgba(0,0,0,0)' }); } catch (e) {}
+            }
+
+            function noteX(note) {
+                return typeof note.getAbsoluteX === 'function' ? note.getAbsoluteX() : (note.absoluteX || 0);
+            }
+
+            function noteY(note) {
+                if (typeof note.getYs === 'function') {
+                    const ys = note.getYs();
+                    return Array.isArray(ys) && ys.length ? ys[0] : 0;
+                }
+                return Array.isArray(note.ys) && note.ys.length ? note.ys[0] : 0;
+            }
+
+            function drawApproxVerticalStaveLine(svg, fromNote, toNote) {
+                if (!svg || !fromNote || !toNote) return;
+                const ns = 'http://www.w3.org/2000/svg';
+                const line = document.createElementNS(ns, 'line');
+                const x1 = noteX(fromNote) + 6;
+                const y1 = noteY(fromNote);
+                const x2 = x1 + 6;
+                const y2 = noteY(toNote);
+                line.setAttribute('x1', String(x1));
+                line.setAttribute('y1', String(y1));
+                line.setAttribute('x2', String(x2));
+                line.setAttribute('y2', String(y2));
+                line.setAttribute('stroke', '#000');
+                line.setAttribute('stroke-width', '1.5');
+                line.setAttribute('stroke-linecap', 'round');
+                svg.appendChild(line);
+            }
+
+            const voiceEvents = {};
+            for (const ev of noteEvents) {
+                const vKey = `${ev.staff}_${ev.voice}_${ev.measure}`;
+                if (!voiceEvents[vKey]) voiceEvents[vKey] = [];
+                voiceEvents[vKey].push(ev);
+            }
+
+            const noteRefMap = {};
+            const measureVoices = {};
+
+            for (const vKey of Object.keys(voiceEvents)) {
+                const [staff, voice, measure] = vKey.split('_').map(Number);
+                const events = voiceEvents[vKey].slice().sort((a, b) => a.xStart - b.xStart);
+                const tickables = [];
+                let cursorBeats = 0;
+
+                for (const ev of events) {
+                    const startBeats = ev.xStart - measure * COLS_PER_MEASURE;
+                    if (startBeats > cursorBeats) {
+                        tickables.push(...makeSpacerTickables(startBeats - cursorBeats));
+                        cursorBeats = startBeats;
+                    }
+                    const key = midiToVexKey(ev.midi);
+                    const note = new Vex.Flow.StaveNote({ keys: [key], duration: ev.duration });
+                    if (ev.dots) addDots(note, ev.dots);
+                    if (ev.hideNotehead) hideNoteheadKeepStem(note);
+                    tickables.push(note);
+                    noteRefMap[ev.id] = note;
+                    cursorBeats += ev.durationBeats;
+                }
+
+                if (cursorBeats < COLS_PER_MEASURE) {
+                    tickables.push(...makeSpacerTickables(COLS_PER_MEASURE - cursorBeats));
+                }
+
+                const voiceObj = new Vex.Flow.Voice({ num_beats: 4, beat_value: 4 })
+                    .setMode(Vex.Flow.Voice.Mode.SOFT);
+                voiceObj.addTickables(tickables);
+
+                const bucketKey = `${staff}_${measure}`;
+                if (!measureVoices[bucketKey]) measureVoices[bucketKey] = [];
+                measureVoices[bucketKey].push(voiceObj);
+            }
+
+            for (let s = 0; s < NUM_STAVES; s++) {
+                for (let m = 0; m < numMeasures; m++) {
+                    const bucketKey = `${s}_${m}`;
+                    const stave = staveList[s]?.[m];
+                    if (!stave) continue;
+                    const voices = measureVoices[bucketKey];
+                    if (!voices || voices.length === 0) {
+                        const voiceObj = new Vex.Flow.Voice({ num_beats: 4, beat_value: 4 })
+                            .setMode(Vex.Flow.Voice.Mode.SOFT);
+                        voiceObj.addTickables([
+                            new Vex.Flow.StaveNote({ keys: ['b/4'], duration: 'wr' })
+                        ]);
+                        new Vex.Flow.Formatter().joinVoices([voiceObj]).format([voiceObj], MEASURE_WIDTH - 8);
+                        voiceObj.draw(context, stave);
+                    } else {
+                        const formatter = new Vex.Flow.Formatter();
+                        formatter.joinVoices(voices).format(voices, MEASURE_WIDTH - 8);
+                        for (const voiceObj of voices) voiceObj.draw(context, stave);
+                    }
+                }
+            }
+
+            for (const tl of tieLines) {
+                const fromNote = noteRefMap[tl.fromEventId];
+                const toNote = noteRefMap[tl.toEventId];
+                if (!fromNote || !toNote) continue;
+                try {
+                    new Vex.Flow.StaveTie({
+                        first_note: fromNote,
+                        last_note: toNote,
+                        first_indices: [0],
+                        last_indices: [0]
+                    }).setContext(context).draw();
+                } catch (e) {
+                    console.warn('StaveTie draw skipped', e);
+                }
+            }
+
+            const svg = container.querySelector('svg');
+            for (const sl of staveLines) {
+                const fromNote = noteRefMap[sl.fromEventId];
+                const toNote = noteRefMap[sl.toEventId];
+                if (!fromNote || !toNote) continue;
+                try {
+                    if (sl.approxVertical) {
+                        drawApproxVerticalStaveLine(svg, fromNote, toNote);
+                    } else {
+                        const staveLine = new Vex.Flow.StaveLine({
+                            first_note: fromNote,
+                            last_note: toNote,
+                            first_indices: [0],
+                            last_indices: [0]
+                        });
+                        staveLine.setContext(context).draw();
+                    }
+                } catch (e) {
+                    console.warn('StaveLine draw skipped', e, sl);
+                }
+            }
+
+            // 画像サイズに応じて小節数・五線数が変わっても、表示枠は常に 1280×720 に固定し、
+            // 楽譜全体は等比縮小して収める。
+            const scale = Math.min(DISPLAY_W / canvasWidth, DISPLAY_H / canvasHeight);
+            const shownW = canvasWidth * scale;
+            const shownH = canvasHeight * scale;
+            const offsetX = (DISPLAY_W - shownW) / 2;
+            const offsetY = (DISPLAY_H - shownH) / 2;
+
+            viewport.style.width = `${DISPLAY_W}px`;
+            viewport.style.height = `${DISPLAY_H}px`;
+            viewport.style.overflow = 'hidden';
+            viewport.style.position = 'relative';
+            container.style.width = `${canvasWidth}px`;
+            container.style.height = `${canvasHeight}px`;
+            container.style.transformOrigin = 'top left';
+            container.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
+
+            if (svg) {
+                svg.setAttribute('viewBox', `0 0 ${canvasWidth} ${canvasHeight}`);
+                svg.setAttribute('width', String(canvasWidth));
+                svg.setAttribute('height', String(canvasHeight));
+                svg.style.display = 'block';
+                svg.style.maxWidth = 'none';
+            }
+        }
+
+        async function saveScoreAsPng() {
+            const container = vexflowContainer.value;
+            if (!container) return;
+            const svg = container.querySelector('svg');
+            if (!svg) return;
+
+            // 画面で見ているのと同じ 1280×720 の白背景PNGを作る。
+            const vb = svg.viewBox && svg.viewBox.baseVal;
+            const sourceW = (vb && vb.width) || Number(svg.getAttribute('width')) || DISPLAY_W;
+            const sourceH = (vb && vb.height) || Number(svg.getAttribute('height')) || DISPLAY_H;
+            const scale = Math.min(DISPLAY_W / sourceW, DISPLAY_H / sourceH);
+            const drawW = sourceW * scale;
+            const drawH = sourceH * scale;
+            const dx = (DISPLAY_W - drawW) / 2;
+            const dy = (DISPLAY_H - drawH) / 2;
+
+            const clone = svg.cloneNode(true);
+            clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+            clone.setAttribute('width', String(sourceW));
+            clone.setAttribute('height', String(sourceH));
+            clone.setAttribute('viewBox', `0 0 ${sourceW} ${sourceH}`);
+
+            const serialized = new XMLSerializer().serializeToString(clone);
+            const blob = new Blob([serialized], { type: 'image/svg+xml;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+
+            try {
+                const image = new Image();
+                await new Promise((resolve, reject) => {
+                    image.onload = resolve;
+                    image.onerror = reject;
+                    image.src = url;
+                });
+
+                const canvas = document.createElement('canvas');
+                canvas.width = DISPLAY_W;
+                canvas.height = DISPLAY_H;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#fff';
+                ctx.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
+                ctx.drawImage(image, dx, dy, drawW, drawH);
+
+                const pngBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+                if (!pngBlob) return;
+                const pngUrl = URL.createObjectURL(pngBlob);
+                const a = document.createElement('a');
+                a.href = pngUrl;
+                a.download = `glissando-score-${Date.now()}.png`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(pngUrl);
+            } finally {
+                URL.revokeObjectURL(url);
+            }
+        }
+
+        function midiToVexKey(midi) {
+            const names = ['c','c#','d','d#','e','f','f#','g','g#','a','a#','b'];
+            const pitchClass = ((Math.round(midi) % 12) + 12) % 12;
+            const octave = Math.floor(Math.round(midi) / 12) - 1;
+            return `${names[pitchClass]}/${octave}`;
+        }
+
+        return {
+            sourceImage, stats, dragover, fileInput,
+            originalCanvas, segmentCanvas, edgeCanvas, vexflowContainer, scoreViewport,
+            threshold, autoThreshold,
+            handleFileSelect, handleDrop,
+            updateThresholdPreview,
+            renderScoreFromCurrentImage,
+            saveScoreAsPng
+        };
+    }
+}).mount('#app');
+</script>
+</body>
+</html>
