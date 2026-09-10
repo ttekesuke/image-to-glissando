@@ -9,7 +9,10 @@ createApp({
         const edgeThreshold=ref(48), blurRadius=ref(1), minTraceLength=ref(12), simplifyTolerance=ref(1.5);
         const geometryPattern=ref('lissajous'), geometryGridCols=ref(64), geometryGridRows=ref(48), geometryComplexity=ref(5);
         const geometryScale=ref(90), geometryRotation=ref(0), geometryOffsetX=ref(0), geometryOffsetY=ref(0), geometrySeed=ref(1), geometryParamA=ref(50), geometryParamB=ref(50);
-        const geometryPatternInfo=computed(()=>ImageGlissGeometry.patterns.find(p=>p.id===geometryPattern.value)||ImageGlissGeometry.patterns[0]);
+        const geometryPatterns=Array.isArray(window.ImageGlissGeometry?.patterns) ? window.ImageGlissGeometry.patterns : [];
+        const currentGeometryPattern=computed(()=>geometryPatterns.find(p=>p.id===geometryPattern.value)||geometryPatterns[0]||null);
+        const geometryParamALabel=computed(()=>currentGeometryPattern.value?.paramA||'Parameter A');
+        const geometryParamBLabel=computed(()=>currentGeometryPattern.value?.paramB||'Parameter B');
         const fileInput=ref(null), originalCanvas=ref(null), segmentCanvas=ref(null), edgeCanvas=ref(null), vexflowContainer=ref(null), scoreViewport=ref(null);
         let extractionCache=null, geometryCache=null, previewTimer=null;
 
@@ -38,6 +41,6 @@ createApp({
         async function renderScore(){await nextTick();if(inputMode.value==='geometry'){if(previewTimer){clearTimeout(previewTimer);previewTimer=null;}const result=runGeometry();drawGeometryPreview(result);const score=ImageGlissScoreConvert.convert(result.traces,result.width,result.height,segmentCanvas.value);if(!score)return;stats.value=score.stats;ImageGlissScoreRender.render(score,vexflowContainer.value,scoreViewport.value);return;}const state=imageState.value;if(!state)return;if(previewTimer){clearTimeout(previewTimer);previewTimer=null;updateExtractionPreview();}const result=runExtraction(),score=ImageGlissScoreConvert.convert(result.traces,state.srcW,state.srcH,segmentCanvas.value);if(!score)return;stats.value=score.stats;ImageGlissScoreRender.render(score,vexflowContainer.value,scoreViewport.value);}
         async function saveScoreAsPng(){await ImageGlissScoreRender.savePng(vexflowContainer.value);}
 
-        return {inputMode,sourceImage,stats,fileInput,originalCanvas,segmentCanvas,edgeCanvas,vexflowContainer,scoreViewport,extractionMode,threshold,autoThreshold,edgeThreshold,blurRadius,minTraceLength,simplifyTolerance,geometryPattern,geometryGridCols,geometryGridRows,geometryComplexity,geometryScale,geometryRotation,geometryOffsetX,geometryOffsetY,geometrySeed,geometryParamA,geometryParamB,geometryPatternInfo,geometryPatterns:ImageGlissGeometry.patterns,handleFileSelect,handleDrop,handleInputModeChange,scheduleExtractionPreview,scheduleGeometryPreview,renderScore,saveScoreAsPng};
+        return {inputMode,sourceImage,stats,fileInput,originalCanvas,segmentCanvas,edgeCanvas,vexflowContainer,scoreViewport,extractionMode,threshold,autoThreshold,edgeThreshold,blurRadius,minTraceLength,simplifyTolerance,geometryPattern,geometryGridCols,geometryGridRows,geometryComplexity,geometryScale,geometryRotation,geometryOffsetX,geometryOffsetY,geometrySeed,geometryParamA,geometryParamB,geometryParamALabel,geometryParamBLabel,geometryPatterns,handleFileSelect,handleDrop,handleInputModeChange,scheduleExtractionPreview,scheduleGeometryPreview,renderScore,saveScoreAsPng};
     }
 }).mount('#app');
