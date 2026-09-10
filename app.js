@@ -7,7 +7,7 @@ createApp({
         const extractionMode=ref('edge');
         const threshold=ref(128), autoThreshold=ref(128);
         const edgeThreshold=ref(48), blurRadius=ref(1), minTraceLength=ref(12), simplifyTolerance=ref(1.5);
-        const geometryPattern=ref('lissajous'), geometryGridCols=ref(64), geometryGridRows=ref(48), geometryComplexity=ref(5);
+        const geometryPattern=ref('lissajous'), geometryGridCols=ref(160), geometryGridRows=ref(640), geometryComplexity=ref(5);
         const geometryScale=ref(90), geometryRotation=ref(0), geometryOffsetX=ref(0), geometryOffsetY=ref(0), geometrySeed=ref(1), geometryParamA=ref(50), geometryParamB=ref(50);
         const geometryPatterns=Array.isArray(window.ImageGlissGeometry?.patterns) ? window.ImageGlissGeometry.patterns : [];
         const currentGeometryPattern=computed(()=>geometryPatterns.find(p=>p.id===geometryPattern.value)||geometryPatterns[0]||null);
