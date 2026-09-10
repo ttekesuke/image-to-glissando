@@ -243,60 +243,65 @@ function render(scoreData, container, viewport) {
         }
 
 async function savePng(container) {
-            if (!container) return;
-            const svg = container.querySelector('svg');
-            if (!svg) return;
+    if (!container) return;
+    const svg = container.querySelector('svg');
+    if (!svg) return;
 
-            const vb = svg.viewBox && svg.viewBox.baseVal;
-            const sourceW = (vb && vb.width) || Number(svg.getAttribute('width')) || DISPLAY_W;
-            const sourceH = (vb && vb.height) || Number(svg.getAttribute('height')) || DISPLAY_H;
-            const scale = Math.min(DISPLAY_W / sourceW, DISPLAY_H / sourceH);
-            const drawW = sourceW * scale;
-            const drawH = sourceH * scale;
-            const dx = (DISPLAY_W - drawW) / 2;
-            const dy = (DISPLAY_H - drawH) / 2;
+    const vb = svg.viewBox && svg.viewBox.baseVal;
+    const sourceW = Math.max(1, Math.round((vb && vb.width) || Number(svg.getAttribute('width')) || DISPLAY_W));
+    const sourceH = Math.max(1, Math.round((vb && vb.height) || Number(svg.getAttribute('height')) || DISPLAY_H));
 
-            const clone = svg.cloneNode(true);
-            clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-            clone.setAttribute('width', String(sourceW));
-            clone.setAttribute('height', String(sourceH));
-            clone.setAttribute('viewBox', `0 0 ${sourceW} ${sourceH}`);
+    const clone = svg.cloneNode(true);
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    clone.setAttribute('width', String(sourceW));
+    clone.setAttribute('height', String(sourceH));
+    clone.setAttribute('viewBox', `0 0 ${sourceW} ${sourceH}`);
+    clone.style.transform = 'none';
+    clone.style.maxWidth = 'none';
+    clone.style.display = 'block';
 
-            const serialized = new XMLSerializer().serializeToString(clone);
-            const blob = new Blob([serialized], { type: 'image/svg+xml;charset=utf-8' });
-            const url = URL.createObjectURL(blob);
+    const bg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    bg.setAttribute('x', '0');
+    bg.setAttribute('y', '0');
+    bg.setAttribute('width', String(sourceW));
+    bg.setAttribute('height', String(sourceH));
+    bg.setAttribute('fill', '#ffffff');
+    clone.insertBefore(bg, clone.firstChild);
 
-            try {
-                const image = new Image();
-                await new Promise((resolve, reject) => {
-                    image.onload = resolve;
-                    image.onerror = reject;
-                    image.src = url;
-                });
+    const serialized = new XMLSerializer().serializeToString(clone);
+    const blob = new Blob([serialized], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
 
-                const canvas = document.createElement('canvas');
-                canvas.width = DISPLAY_W;
-                canvas.height = DISPLAY_H;
-                const ctx = canvas.getContext('2d');
-                ctx.fillStyle = '#fff';
-                ctx.fillRect(0, 0, DISPLAY_W, DISPLAY_H);
-                ctx.drawImage(image, dx, dy, drawW, drawH);
+    try {
+        const image = new Image();
+        await new Promise((resolve, reject) => {
+            image.onload = resolve;
+            image.onerror = reject;
+            image.src = url;
+        });
 
-                const pngBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
-                if (!pngBlob) return;
-                const pngUrl = URL.createObjectURL(pngBlob);
-                const a = document.createElement('a');
-                a.href = pngUrl;
-                a.download = `glissando-score-${Date.now()}.png`;
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                URL.revokeObjectURL(pngUrl);
-            } finally {
-                URL.revokeObjectURL(url);
-            }
-        }
+        const canvas = document.createElement('canvas');
+        canvas.width = sourceW;
+        canvas.height = sourceH;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, sourceW, sourceH);
+        ctx.drawImage(image, 0, 0, sourceW, sourceH);
 
+        const pngBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+        if (!pngBlob) return;
+        const pngUrl = URL.createObjectURL(pngBlob);
+        const a = document.createElement('a');
+        a.href = pngUrl;
+        a.download = `glissando-score-${sourceW}x${sourceH}-${Date.now()}.png`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(pngUrl);
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+}
 function midiToVexKey(midi) {
     const names=['c','c#','d','d#','e','f','f#','g','g#','a','a#','b'];
     const pitchClass=((Math.round(midi)%12)+12)%12;
