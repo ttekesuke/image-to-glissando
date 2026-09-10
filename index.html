@@ -33,8 +33,8 @@ body{font-family:sans-serif}.layout{display:flex;align-items:flex-start;gap:16px
 </template>
 
 <template v-else>
-<label>Grid columns (quarter-note cells): <input type="number" min="4" max="256" v-model="geometryGridCols" @input="scheduleGeometryPreview"></label>
-<label>Grid rows (pitch cells): <input type="number" min="8" max="160" v-model="geometryGridRows" @input="scheduleGeometryPreview"></label>
+<label>Grid columns (quarter-note cells): <input type="number" min="4" max="640" v-model="geometryGridCols" @input="scheduleGeometryPreview"></label>
+<label>Grid rows (pitch cells): <input type="number" min="8" max="640" v-model="geometryGridRows" @input="scheduleGeometryPreview"></label>
 <label>Pattern: <select v-model="geometryPattern" @change="scheduleGeometryPreview"><option v-for="p in geometryPatterns" :key="p.id" :value="p.id">{{ p.label }}</option></select></label>
 <label>Complexity: {{ geometryComplexity }} <input type="range" min="1" max="10" step="1" v-model="geometryComplexity" @input="scheduleGeometryPreview"></label>
 <label>Scale: {{ geometryScale }}% <input type="range" min="20" max="140" step="1" v-model="geometryScale" @input="scheduleGeometryPreview"></label>
@@ -61,10 +61,10 @@ body{font-family:sans-serif}.layout{display:flex;align-items:flex-start;gap:16px
 </div>
 </div>
 </div>
-<script src="./extractor.js?v=4"></script>
-<script src="./geometry.js?v=4"></script>
-<script src="./score-convert.js?v=4"></script>
-<script src="./score-render.js?v=4"></script>
-<script src="./app.js?v=4"></script>
+<script src="./extractor.js?v=5"></script>
+<script src="./geometry.js?v=5"></script>
+<script src="./score-convert.js?v=5"></script>
+<script src="./score-render.js?v=5"></script>
+<script src="./app.js?v=5"></script>
 </body>
 </html>
