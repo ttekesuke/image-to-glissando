@@ -195,7 +195,7 @@ function genRandomWalk(o){
 const generators={lissajous:genLissajous,rose:genRose,spirograph:genSpiro,epicycloid:genEpicycloid,lemniscate:genLemniscate,spiral:genSpiral,star:genStar,concentric:genConcentric,waves:genWaves,interference:genInterference,koch:genKoch,dragon:genDragon,hilbert:genHilbert,sierpinski:genSierpinski,tree:genTree,mandelbrot:o=>fractalField(o,false),julia:o=>fractalField(o,true),clifford:genClifford,randomwalk:genRandomWalk};
 
 function generate(options={}){
-  const gridCols=clamp(Math.round(Number(options.gridCols)||64),4,256),gridRows=clamp(Math.round(Number(options.gridRows)||48),8,160);
+  const gridCols=clamp(Math.round(Number(options.gridCols)||64),4,640),gridRows=clamp(Math.round(Number(options.gridRows)||48),8,640);
   const width=gridCols*20,height=gridRows*5;
   const gen=generators[options.pattern]||genLissajous;
   let normalized=gen({...options,complexity:clamp(Math.round(Number(options.complexity)||5),1,10)});
