@@ -41,8 +41,8 @@ body{font-family:sans-serif}.layout{display:flex;align-items:flex-start;gap:16px
 <label>Rotation: {{ geometryRotation }}° <input type="range" min="-180" max="180" step="1" v-model="geometryRotation" @input="scheduleGeometryPreview"></label>
 <label>Offset X: {{ geometryOffsetX }}% <input type="range" min="-45" max="45" step="1" v-model="geometryOffsetX" @input="scheduleGeometryPreview"></label>
 <label>Offset Y: {{ geometryOffsetY }}% <input type="range" min="-45" max="45" step="1" v-model="geometryOffsetY" @input="scheduleGeometryPreview"></label>
-<label>{{ geometryPatternInfo.paramA }}: {{ geometryParamA }} <input type="range" min="0" max="100" step="1" v-model="geometryParamA" @input="scheduleGeometryPreview"></label>
-<label>{{ geometryPatternInfo.paramB }}: {{ geometryParamB }} <input type="range" min="0" max="100" step="1" v-model="geometryParamB" @input="scheduleGeometryPreview"></label>
+<label>{{ geometryParamALabel }}: {{ geometryParamA }} <input type="range" min="0" max="100" step="1" v-model="geometryParamA" @input="scheduleGeometryPreview"></label>
+<label>{{ geometryParamBLabel }}: {{ geometryParamB }} <input type="range" min="0" max="100" step="1" v-model="geometryParamB" @input="scheduleGeometryPreview"></label>
 <label>Seed: <input type="number" v-model="geometrySeed" @input="scheduleGeometryPreview"></label>
 </template>
 
