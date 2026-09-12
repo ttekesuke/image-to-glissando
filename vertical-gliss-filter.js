@@ -104,7 +104,20 @@ base.convert = function(rawTraces, srcW, srcH, segC) {
 
         // If the source geometry does not contain a real vertical run here, fall back to a
         // normal VexFlow StaveLine so it reaches the destination note instead of ending in space.
-        if (!backedByTrueVerticalRun) line.approxVertical = false;
+        if (!backedByTrueVerticalRun) {
+            line.approxVertical = false;
+            continue;
+        }
+
+        // A true vertical glissando has no real elapsed horizontal time. Represent it using
+        // standard notation: the source pitch becomes a grace note and the arrival remains
+        // a normal note. The renderer keeps the original beat occupied by an invisible
+        // GhostNote so the rest of the score timing/layout stays unchanged.
+        line.verticalGrace = true;
+        from.isGraceSource = true;
+        from.graceTargetEventId = to.id;
+        if (!Array.isArray(to.graceSourceEventIds)) to.graceSourceEventIds = [];
+        if (!to.graceSourceEventIds.includes(from.id)) to.graceSourceEventIds.push(from.id);
     }
 
     return result;
