@@ -232,9 +232,9 @@ function convert(rawTraces, srcW, srcH, segC) {
             for (const seg of segments) {
                 if (!seg.points || seg.points.length < 2) continue;
 
-                // 解析4列 -> 四分音符1列へ縮約する。ただし、同じ四分音符列の中を
-                // 縦方向に移動している線は1点へ潰さない。従来は各bucketから代表点を
-                // 1つだけ選んでいたため、純粋な垂直線がここで完全に消えていた。
+                // 解析4列 -> 四分音符1列へ縮約する。ただし、実際に解析グリッド上で
+                // xが同じ垂直線だけは上下2点を残す。単に傾きが急な斜線を垂直扱い
+                // すると、通常の大きな跳躍まで短い急線に置き換わってしまう。
                 const buckets = new Map();
                 for (const p of seg.points) {
                     const sx = clampInt(
@@ -257,12 +257,7 @@ function convert(rawTraces, srcW, srcH, segC) {
                     const pitchMax = Math.max(...pitches);
                     const pitchSpan = pitchMax - pitchMin;
 
-                    // xの移動量より音高方向の移動量が大きければ「縦寄り」とみなし、
-                    // 同一時刻列に上下2つのanchorを残す。後段のscheduledAnchorsが
-                    // 2つ目を1拍だけ右へずらし、approxVerticalとして描画する。
-                    const verticalish = pitchSpan >= 1 && (
-                        analysisXSpan === 0 || pitchSpan >= Math.max(2, analysisXSpan * 2)
-                    );
+                    const verticalish = pitchSpan >= 1 && analysisXSpan === 0;
 
                     if (verticalish) {
                         const firstPitch = candidates[0].pitch;
@@ -433,9 +428,19 @@ function convert(rawTraces, srcW, srcH, segC) {
                     const prev = scheduledAnchors[scheduledAnchors.length - 1];
                     let scheduledX = a.x;
                     let approxVerticalFromPrev = false;
-                    if (prev && scheduledX <= prev.x) {
-                        scheduledX = prev.x + 1;
-                        approxVerticalFromPrev = true;
+                    if (prev) {
+                        const currentOriginalX = a.originalX ?? a.x;
+                        const prevOriginalX = prev.originalX ?? prev.x;
+                        const sameOriginalXAsPrev = currentOriginalX === prevOriginalX;
+
+                        if (sameOriginalXAsPrev) {
+                            scheduledX = prev.x + 1;
+                            approxVerticalFromPrev = true;
+                        } else if (scheduledX <= prev.x) {
+                            // 直前の真の垂直線を1拍ぶん展開した結果の時間衝突。
+                            // 時刻だけ前へ送るが、この接続自体は垂直扱いしない。
+                            scheduledX = prev.x + 1;
+                        }
                     }
                     scheduledAnchors.push({
                         ...a,
@@ -504,14 +509,12 @@ function convert(rawTraces, srcW, srcH, segC) {
                     const fromEventId = anchorFirstEventIds[a];
                     const toEventId = anchorFirstEventIds[a + 1];
                     if (fromEventId !== null && toEventId !== null) {
-                        const dx = scheduledAnchors[a + 1].x - scheduledAnchors[a].x;
-                        const dy = Math.abs(scheduledAnchors[a + 1].pitch - scheduledAnchors[a].pitch);
                         staveLines.push({
                             fromEventId,
                             toEventId,
                             staff,
                             voice,
-                            approxVertical: scheduledAnchors[a + 1].approxVerticalFromPrev || (dx <= 1 && dy >= 2)
+                            approxVertical: scheduledAnchors[a + 1].approxVerticalFromPrev
                         });
                     }
                 }
